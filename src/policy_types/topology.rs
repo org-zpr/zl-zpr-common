@@ -138,6 +138,10 @@ impl TryFrom<v1::peering::Reader<'_>> for Peering {
     }
 }
 
+/// Writes into a freshly initialised builder, like every `WriteTo` in this crate
+/// (`init_root`, or an element of a freshly `init_*`ed list). A `None` substrate
+/// is written by not touching the field, which leaves it unset only on a fresh
+/// builder: the generated capnp builder has no call that clears a struct field.
 impl WriteTo<v1::peering::Builder<'_>> for Peering {
     fn write_to(&self, bldr: &mut v1::peering::Builder) {
         bldr.set_link_id(&self.link_id);

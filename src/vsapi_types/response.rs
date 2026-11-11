@@ -33,7 +33,13 @@ impl TryFrom<v1::login_nonce::Reader<'_>> for LoginNonce {
     fn try_from(reader: v1::login_nonce::Reader<'_>) -> Result<Self, Self::Error> {
         Ok(LoginNonce {
             nonce: reader.get_nonce()?.to_string()?,
-            expires_at: UNIX_EPOCH + Duration::from_secs(reader.get_expires_at()),
+            // checked_add: an expiresAt beyond SystemTime's range is malformed
+            // wire data and must be an error, not a panic.
+            expires_at: UNIX_EPOCH
+                .checked_add(Duration::from_secs(reader.get_expires_at()))
+                .ok_or(VsapiTypeError::DeserializationError(
+                    "loginNonce expiresAt out of range",
+                ))?,
         })
     }
 }
@@ -279,6 +285,20 @@ mod tests {
         };
         let result = roundtrip_login_nonce(&original);
         assert_eq!(result, original);
+    }
+
+    // A malformed expiresAt beyond SystemTime's range must be a decode error, not
+    // a panic: this is wire data from the visa service.
+    #[test]
+    fn test_login_nonce_overflowing_expires_at_is_an_error() {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::login_nonce::Builder<'_> = msg.init_root();
+            root.set_nonce("n");
+            root.set_expires_at(u64::MAX);
+        }
+        let reader: v1::login_nonce::Reader<'_> = msg.get_root_as_reader().unwrap();
+        assert!(LoginNonce::try_from(reader).is_err());
     }
 
     // expiresAt on the wire is unix seconds, not milliseconds like a visa's expiry.
