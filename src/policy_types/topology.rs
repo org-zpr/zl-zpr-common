@@ -11,9 +11,12 @@ use crate::write_to::WriteTo;
 pub struct Peering {
     pub link_id: String,
     pub node_a: IpAddr, // by convention we are using ZPR address
-    pub substrate_a: NetAddr,
+    /// Substrate address of node A. `None` means policy gives none: the node
+    /// reports its own when it authenticates (policy.capnp `Peering`).
+    pub substrate_a: Option<NetAddr>,
     pub node_b: IpAddr, // by convention we are using ZPR address
-    pub substrate_b: NetAddr,
+    /// Substrate address of node B; `None` as for `substrate_a`.
+    pub substrate_b: Option<NetAddr>,
     pub attributes: Vec<AttrExp>,
 }
 
@@ -104,10 +107,20 @@ impl TryFrom<v1::peering::Reader<'_>> for Peering {
         // NOTE: In Capn Proto the node identifiers are strings. For time being we are using the
         // node ZPR address.
         let node_a: IpAddr = reader.get_node_a()?.to_string()?.parse()?;
-        let substrate_a: NetAddr = reader.get_node_a_substrate()?.try_into()?;
+        // An unset NetAddr would otherwise read as hostname "" port 0, so check
+        // has_*() first: unset means the node reports its own substrate address.
+        let substrate_a = if reader.has_node_a_substrate() {
+            Some(reader.get_node_a_substrate()?.try_into()?)
+        } else {
+            None
+        };
 
         let node_b: IpAddr = reader.get_node_b()?.to_string()?.parse()?;
-        let substrate_b: NetAddr = reader.get_node_b_substrate()?.try_into()?;
+        let substrate_b = if reader.has_node_b_substrate() {
+            Some(reader.get_node_b_substrate()?.try_into()?)
+        } else {
+            None
+        };
 
         let mut attributes = Vec::new();
         for attr in reader.get_attrs()?.iter() {
@@ -125,15 +138,22 @@ impl TryFrom<v1::peering::Reader<'_>> for Peering {
     }
 }
 
+/// Writes into a freshly initialised builder, like every `WriteTo` in this crate
+/// (`init_root`, or an element of a freshly `init_*`ed list). A `None` substrate
+/// is written by not touching the field, which leaves it unset only on a fresh
+/// builder: the generated capnp builder has no call that clears a struct field.
 impl WriteTo<v1::peering::Builder<'_>> for Peering {
     fn write_to(&self, bldr: &mut v1::peering::Builder) {
         bldr.set_link_id(&self.link_id);
         bldr.set_node_a(&self.node_a.to_string());
-        self.substrate_a
-            .write_to(&mut bldr.reborrow().init_node_a_substrate());
+        // None leaves the field unset on the wire (see the Peering doc comment).
+        if let Some(a) = &self.substrate_a {
+            a.write_to(&mut bldr.reborrow().init_node_a_substrate());
+        }
         bldr.set_node_b(&self.node_b.to_string());
-        self.substrate_b
-            .write_to(&mut bldr.reborrow().init_node_b_substrate());
+        if let Some(b) = &self.substrate_b {
+            b.write_to(&mut bldr.reborrow().init_node_b_substrate());
+        }
 
         let mut attr_list = bldr.reborrow().init_attrs(self.attributes.len() as u32);
         for (i, attr) in self.attributes.iter().enumerate() {
@@ -322,15 +342,15 @@ mod tests {
         let original = Peering {
             link_id: "link-001".to_string(),
             node_a: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            substrate_a: NetAddr {
+            substrate_a: Some(NetAddr {
                 host: NetworkHost::Ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
                 port: 5000,
-            },
+            }),
             node_b: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-            substrate_b: NetAddr {
+            substrate_b: Some(NetAddr {
                 host: NetworkHost::Hostname("host-b.net".to_string()),
                 port: 5001,
-            },
+            }),
             attributes: vec![],
         };
         let mut msg = capnp::message::Builder::new_default();
@@ -344,6 +364,7 @@ mod tests {
         assert_eq!(result.node_a, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(result.node_b, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         assert!(result.attributes.is_empty());
+        assert_eq!(result, original);
     }
 
     #[test]
@@ -352,15 +373,15 @@ mod tests {
         let original = Peering {
             link_id: "link-002".to_string(),
             node_a: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
-            substrate_a: NetAddr {
+            substrate_a: Some(NetAddr {
                 host: NetworkHost::Ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))),
                 port: 4000,
-            },
+            }),
             node_b: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)),
-            substrate_b: NetAddr {
+            substrate_b: Some(NetAddr {
                 host: NetworkHost::Ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 2))),
                 port: 4001,
-            },
+            }),
             attributes: vec![AttrExp {
                 key: "link.class".to_string(),
                 op: AttrOp::Eq,
@@ -379,5 +400,80 @@ mod tests {
         assert_eq!(result.attributes[0].key, "link.class");
         assert_eq!(result.attributes[0].op, AttrOp::Eq);
         assert_eq!(result.attributes[0].value, vec!["trusted"]);
+    }
+
+    // --- Peering with no substrate address (policy.capnp: unset = node reports its own) ---
+
+    /// Builds a Peering message that sets each substrate field only when given.
+    fn make_peering_msg(
+        substrate_a: Option<&NetAddr>,
+        substrate_b: Option<&NetAddr>,
+    ) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::peering::Builder<'_> = msg.init_root();
+            root.set_link_id("link-zodes");
+            root.set_node_a("fd5a:5052::1");
+            root.set_node_b("fd5a:5052::2");
+            if let Some(a) = substrate_a {
+                a.write_to(&mut root.reborrow().init_node_a_substrate());
+            }
+            if let Some(b) = substrate_b {
+                b.write_to(&mut root.reborrow().init_node_b_substrate());
+            }
+        }
+        msg
+    }
+
+    fn relay_substrate() -> NetAddr {
+        NetAddr {
+            host: NetworkHost::Ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            port: 5000,
+        }
+    }
+
+    // Both ends unset (a direct link between two endpoint Zodes) decodes to None/None.
+    // Before this change it decoded "successfully" to Hostname("") port 0.
+    #[test]
+    fn test_peering_both_substrates_unset_decode_to_none() {
+        let msg = make_peering_msg(None, None);
+        let reader: v1::peering::Reader<'_> = msg.get_root_as_reader().unwrap();
+        let p = Peering::try_from(reader).unwrap();
+        assert_eq!(p.substrate_a, None);
+        assert_eq!(p.substrate_b, None);
+    }
+
+    // One end set (the relay), one unset (an endpoint): each decodes on its own.
+    #[test]
+    fn test_peering_one_substrate_unset() {
+        let relay = relay_substrate();
+        let msg = make_peering_msg(Some(&relay), None);
+        let reader: v1::peering::Reader<'_> = msg.get_root_as_reader().unwrap();
+        let p = Peering::try_from(reader).unwrap();
+        assert_eq!(p.substrate_a, Some(relay));
+        assert_eq!(p.substrate_b, None);
+    }
+
+    // Writing None must leave the field unset on the wire, not write an empty
+    // NetAddr that a reader could take for a real address.
+    #[test]
+    fn test_peering_none_substrate_stays_unset_on_wire() {
+        let original = Peering {
+            link_id: "link-none".to_string(),
+            node_a: "fd5a:5052::1".parse().unwrap(),
+            substrate_a: None,
+            node_b: "fd5a:5052::2".parse().unwrap(),
+            substrate_b: Some(relay_substrate()),
+            attributes: vec![],
+        };
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::peering::Builder<'_> = msg.init_root();
+            original.write_to(&mut root);
+        }
+        let reader: v1::peering::Reader<'_> = msg.get_root_as_reader().unwrap();
+        assert!(!reader.has_node_a_substrate());
+        assert!(reader.has_node_b_substrate());
+        assert_eq!(Peering::try_from(reader).unwrap(), original);
     }
 }

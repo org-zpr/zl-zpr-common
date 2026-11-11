@@ -1,6 +1,6 @@
 [package]
 name = "zpr"
-version = "0.31.2"
+version = "0.32.0-zodes.1"
 edition = "2024"
 rust-version = "1.98.1"
 license = "Apache-2.0"

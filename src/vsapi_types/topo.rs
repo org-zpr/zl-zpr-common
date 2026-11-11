@@ -16,6 +16,30 @@ pub struct Link {
     pub visas: Vec<Visa>,
     /// ZPR address of the peer.
     pub zpr_addr: IpAddr,
+    /// CN the peer's CA-signed link certificate must carry. Empty (a sender that
+    /// predates `peerCn`) means no peer can satisfy the check; the node enforces
+    /// that, the decoder does not reject it.
+    pub peer_cn: String,
+}
+
+/// State of one link as a node reports it (vs.capnp `LinkState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    /// Established, and the peer's certificate verified with the expected CN.
+    Up,
+    /// Was up, and is now lost or closed.
+    Down,
+    /// Could not be established (no answer, handshake or certificate refused).
+    Failed,
+}
+
+/// One entry of a node's link-state snapshot (vs.capnp `LinkStateReport`), sent
+/// with `VSHandle.reportLinkStates`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkStateReport {
+    /// The peer's link-certificate CN, as in `Link::peer_cn`.
+    pub peer_cn: String,
+    pub state: LinkState,
 }
 
 impl From<v1::LinkRole> for LinkRole {
@@ -24,6 +48,37 @@ impl From<v1::LinkRole> for LinkRole {
             v1::LinkRole::Active => LinkRole::Active,
             v1::LinkRole::Backup => LinkRole::Backup,
         }
+    }
+}
+
+impl From<v1::LinkState> for LinkState {
+    fn from(s: v1::LinkState) -> Self {
+        match s {
+            v1::LinkState::Up => LinkState::Up,
+            v1::LinkState::Down => LinkState::Down,
+            v1::LinkState::Failed => LinkState::Failed,
+        }
+    }
+}
+
+impl From<LinkState> for v1::LinkState {
+    fn from(s: LinkState) -> Self {
+        match s {
+            LinkState::Up => v1::LinkState::Up,
+            LinkState::Down => v1::LinkState::Down,
+            LinkState::Failed => v1::LinkState::Failed,
+        }
+    }
+}
+
+impl TryFrom<v1::link_state_report::Reader<'_>> for LinkStateReport {
+    type Error = VsapiTypeError;
+
+    fn try_from(reader: v1::link_state_report::Reader<'_>) -> Result<Self, Self::Error> {
+        Ok(LinkStateReport {
+            peer_cn: reader.get_peer_cn()?.to_string()?,
+            state: LinkState::from(reader.get_state()?),
+        })
     }
 }
 
@@ -40,6 +95,7 @@ impl TryFrom<v1::link::Reader<'_>> for Link {
             ));
         }
         let zpr_addr = IpAddr::try_from(reader.get_zpr_addr()?)?;
+        let peer_cn = reader.get_peer_cn()?.to_string()?;
 
         let mut visas = Vec::new();
         for visa_reader in reader.get_visas()?.iter() {
@@ -52,6 +108,7 @@ impl TryFrom<v1::link::Reader<'_>> for Link {
             role,
             visas,
             zpr_addr,
+            peer_cn,
         })
     }
 }
@@ -211,6 +268,7 @@ mod tests {
             role: LinkRole::Active,
             visas: vec![],
             zpr_addr: TEST_ZPR_ADDR.parse().unwrap(),
+            peer_cn: "relay.zpr".to_string(),
         };
         let result = roundtrip_link(&original);
         assert_eq!(result, original);
@@ -229,6 +287,7 @@ mod tests {
             role: LinkRole::Backup,
             visas: vec![make_visa(7), make_visa(8)],
             zpr_addr: IpAddr::V6("fd5a:5052::7".parse().unwrap()),
+            peer_cn: "host-b.zpr".to_string(),
         };
         let result = roundtrip_link(&original);
         assert_eq!(result, original);
@@ -247,6 +306,7 @@ mod tests {
             role: LinkRole::Active,
             visas: vec![],
             zpr_addr: zpr_ip,
+            peer_cn: String::new(),
         };
         let result = roundtrip_link(&original);
         assert_eq!(result.zpr_addr, zpr_ip);
@@ -261,6 +321,73 @@ mod tests {
             make_link_msg_with_zpr_addr("link-no-zpr-addr", ip, 4500, v1::LinkRole::Active, None);
         let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
         assert!(Link::try_from(reader).is_err());
+    }
+
+    // peerCn must carry through a capnp write/read roundtrip.
+    #[test]
+    fn test_link_roundtrip_peer_cn() {
+        let original = Link {
+            link_id: "rt-peer-cn".to_string(),
+            peer: SockAddr {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+                port: 5000,
+            },
+            role: LinkRole::Active,
+            visas: vec![],
+            zpr_addr: TEST_ZPR_ADDR.parse().unwrap(),
+            peer_cn: "endpoint-a.zpr".to_string(),
+        };
+        let result = roundtrip_link(&original);
+        assert_eq!(result.peer_cn, "endpoint-a.zpr");
+        assert_eq!(result, original);
+    }
+
+    // A sender that predates peerCn leaves it unset. That decodes to an empty CN
+    // (which no peer certificate can match), not to an error.
+    #[test]
+    fn test_link_tryfrom_peer_cn_absent_is_empty() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let msg = make_link_msg("link-no-cn", ip, 4500, v1::LinkRole::Active);
+        let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
+        let link = Link::try_from(reader).unwrap();
+        assert_eq!(link.peer_cn, "");
+    }
+
+    /// Every pairing between the capnp link state and ours, asserted as explicit
+    /// pairs so two swapped variants cannot pass a roundtrip.
+    const LINK_STATE_PAIRS: [(v1::LinkState, LinkState); 3] = [
+        (v1::LinkState::Up, LinkState::Up),
+        (v1::LinkState::Down, LinkState::Down),
+        (v1::LinkState::Failed, LinkState::Failed),
+    ];
+
+    #[test]
+    fn test_link_state_maps_both_ways() {
+        for (wire, ours) in LINK_STATE_PAIRS {
+            assert_eq!(LinkState::from(wire), ours);
+            assert_eq!(v1::LinkState::from(ours), wire);
+        }
+    }
+
+    fn roundtrip_link_state_report(report: &LinkStateReport) -> LinkStateReport {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::link_state_report::Builder<'_> = msg.init_root();
+            report.write_to(&mut root);
+        }
+        let reader: v1::link_state_report::Reader<'_> = msg.get_root_as_reader().unwrap();
+        LinkStateReport::try_from(reader).unwrap()
+    }
+
+    #[test]
+    fn test_link_state_report_roundtrip_each_state() {
+        for (_, state) in LINK_STATE_PAIRS {
+            let original = LinkStateReport {
+                peer_cn: "relay.zpr".to_string(),
+                state,
+            };
+            assert_eq!(roundtrip_link_state_report(&original), original);
+        }
     }
 
     #[test]

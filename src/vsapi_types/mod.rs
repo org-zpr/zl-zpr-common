@@ -28,10 +28,11 @@ pub use request::{
     Claim, ConnectRequest, ConnectType, PublicKey, ReauthRequest, VSConnectRequest, VisaRequest,
 };
 pub use response::{
-    Connection, Denied, DenyCode, DisconnectNotice, DisconnectReason, VisaDecision, VisaResponse,
+    Connection, Denied, DenyCode, DisconnectNotice, DisconnectReason, LoginNonce, VisaDecision,
+    VisaResponse,
 };
 pub use services::{AuthServicesList, OidcClientConfig, ServiceDescriptor, ServiceT};
-pub use topo::{Link, LinkRole};
+pub use topo::{Link, LinkRole, LinkState, LinkStateReport};
 pub use util::ip::ip_addr_from_vec;
 pub use util::time::visa_expiration_timestamp_to_system_time;
 pub use visa::{

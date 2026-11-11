@@ -1,10 +1,48 @@
 use std::fmt;
 use std::net::IpAddr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::vsapi::v1;
 use crate::vsapi_types::error::ErrorCode;
 use crate::vsapi_types::{ApiResponseError, Visa, VsapiTypeError};
+
+/// A login nonce minted by the visa service (vs.capnp `LoginNonce`, returned by
+/// `VSHandle.getLoginNonce`). The node uses `nonce` verbatim as the OIDC
+/// authorization request's `nonce`; the visa service accepts it once, before
+/// `expires_at`, for the actor and session it was issued to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginNonce {
+    pub nonce: String,
+    pub expires_at: SystemTime,
+}
+
+impl LoginNonce {
+    /// Expiry as unix seconds, the wire format of `LoginNonce.expiresAt`. A time
+    /// before the epoch (never minted in practice) clamps to 0.
+    pub fn expires_at_secs(&self) -> u64 {
+        self.expires_at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
+impl TryFrom<v1::login_nonce::Reader<'_>> for LoginNonce {
+    type Error = VsapiTypeError;
+
+    fn try_from(reader: v1::login_nonce::Reader<'_>) -> Result<Self, Self::Error> {
+        Ok(LoginNonce {
+            nonce: reader.get_nonce()?.to_string()?,
+            // checked_add: an expiresAt beyond SystemTime's range is malformed
+            // wire data and must be an error, not a panic.
+            expires_at: UNIX_EPOCH
+                .checked_add(Duration::from_secs(reader.get_expires_at()))
+                .ok_or(VsapiTypeError::DeserializationError(
+                    "loginNonce expiresAt out of range",
+                ))?,
+        })
+    }
+}
 
 /// Info recieved from VS in response to ConnectRequest
 #[derive(Debug)]
@@ -225,8 +263,60 @@ impl From<v1::ErrorCode> for ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::write_to::WriteTo;
     use std::net::Ipv4Addr;
-    use std::time::Duration;
+
+    fn roundtrip_login_nonce(nonce: &LoginNonce) -> LoginNonce {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::login_nonce::Builder<'_> = msg.init_root();
+            nonce.write_to(&mut root);
+        }
+        let reader: v1::login_nonce::Reader<'_> = msg.get_root_as_reader().unwrap();
+        LoginNonce::try_from(reader).unwrap()
+    }
+
+    // The nonce text is used verbatim and expiresAt is exact to the second.
+    #[test]
+    fn test_login_nonce_roundtrip() {
+        let original = LoginNonce {
+            nonce: "q7Zt-3vXr_9a".to_string(),
+            expires_at: UNIX_EPOCH + Duration::from_secs(1_800_000_123),
+        };
+        let result = roundtrip_login_nonce(&original);
+        assert_eq!(result, original);
+    }
+
+    // A malformed expiresAt beyond SystemTime's range must be a decode error, not
+    // a panic: this is wire data from the visa service.
+    #[test]
+    fn test_login_nonce_overflowing_expires_at_is_an_error() {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::login_nonce::Builder<'_> = msg.init_root();
+            root.set_nonce("n");
+            root.set_expires_at(u64::MAX);
+        }
+        let reader: v1::login_nonce::Reader<'_> = msg.get_root_as_reader().unwrap();
+        assert!(LoginNonce::try_from(reader).is_err());
+    }
+
+    // expiresAt on the wire is unix seconds, not milliseconds like a visa's expiry.
+    #[test]
+    fn test_login_nonce_expires_at_is_seconds() {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::login_nonce::Builder<'_> = msg.init_root();
+            root.set_nonce("n");
+            root.set_expires_at(1_800_000_000);
+        }
+        let reader: v1::login_nonce::Reader<'_> = msg.get_root_as_reader().unwrap();
+        let nonce = LoginNonce::try_from(reader).unwrap();
+        assert_eq!(
+            nonce.expires_at,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+        );
+    }
 
     /// Every 1:1 pairing between the capnp deny code and our own.
     ///
