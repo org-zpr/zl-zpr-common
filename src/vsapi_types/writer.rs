@@ -3,9 +3,9 @@ use std::net::IpAddr;
 use crate::vsapi::v1;
 use crate::vsapi_types::{
     ApiResponseError, AuthBlob, ChallengeAlg, Claim, CommFlag, ConnectRequest, Connection, DockPep,
-    DockPepType, EndpointT, FwdPep, FwdPepStyle, IcmpPep, KeySet, Link, LinkRole, PacketDesc,
-    Param, ParamValue, PublicKey, ReauthRequest, ServiceDescriptor, ServiceT, SockAddr, TcpUdpPep,
-    VSConnectRequest, Visa, VisaOp, VisaType,
+    DockPepType, EndpointT, FwdPep, FwdPepStyle, IcmpPep, KeySet, Link, LinkRole, LinkStateReport,
+    LoginNonce, PacketDesc, Param, ParamValue, PublicKey, ReauthRequest, ServiceDescriptor,
+    ServiceT, SockAddr, TcpUdpPep, VSConnectRequest, Visa, VisaOp, VisaType,
 };
 use crate::write_to::WriteTo;
 
@@ -28,11 +28,26 @@ impl WriteTo<v1::link::Builder<'_>> for Link {
         });
         let mut zpr_addr_bldr = bldr.reborrow().init_zpr_addr();
         self.zpr_addr.write_to(&mut zpr_addr_bldr);
+        bldr.set_peer_cn(&self.peer_cn);
         let mut visas_bldr = bldr.reborrow().init_visas(self.visas.len() as u32);
         for (i, visa) in self.visas.iter().enumerate() {
             let mut visa_bldr = visas_bldr.reborrow().get(i as u32);
             visa.write_to(&mut visa_bldr);
         }
+    }
+}
+
+impl WriteTo<v1::link_state_report::Builder<'_>> for LinkStateReport {
+    fn write_to(&self, bldr: &mut v1::link_state_report::Builder<'_>) {
+        bldr.set_peer_cn(&self.peer_cn);
+        bldr.set_state(self.state.into());
+    }
+}
+
+impl WriteTo<v1::login_nonce::Builder<'_>> for LoginNonce {
+    fn write_to(&self, bldr: &mut v1::login_nonce::Builder<'_>) {
+        bldr.set_nonce(&self.nonce);
+        bldr.set_expires_at(self.expires_at_secs());
     }
 }
 
