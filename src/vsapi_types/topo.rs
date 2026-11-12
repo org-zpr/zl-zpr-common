@@ -14,11 +14,11 @@ pub struct Link {
     pub peer: SockAddr,
     pub role: LinkRole,
     pub visas: Vec<Visa>,
-    /// ZPR address of the peer.
+    /// ZPR address of the peer. Required: the node compares it with its own to
+    /// decide who dials (ZODE_LINKS.md). The decoder rejects a link without it.
     pub zpr_addr: IpAddr,
-    /// CN the peer's CA-signed link certificate must carry. Empty (a sender that
-    /// predates `peerCn`) means no peer can satisfy the check; the node enforces
-    /// that, the decoder does not reject it.
+    /// CN the peer's CA-signed link certificate must carry. Required and non-empty:
+    /// the decoder rejects a link without it.
     pub peer_cn: String,
 }
 
@@ -26,10 +26,12 @@ pub struct Link {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
     /// Established, and the peer's certificate verified with the expected CN.
+    /// Reported by both ends.
     Up,
-    /// Was up, and is now lost or closed.
+    /// Was up, and is now lost or closed. Reported by both ends.
     Down,
-    /// Could not be established (no answer, handshake or certificate refused).
+    /// Reported only by the link's owner, after the link-up window passed without
+    /// the link coming up. The non-owner never reports it.
     Failed,
 }
 
@@ -95,7 +97,13 @@ impl TryFrom<v1::link::Reader<'_>> for Link {
             ));
         }
         let zpr_addr = IpAddr::try_from(reader.get_zpr_addr()?)?;
+        // A missing peerCn reads as empty; both are rejected (required, non-empty).
         let peer_cn = reader.get_peer_cn()?.to_string()?;
+        if peer_cn.is_empty() {
+            return Err(VsapiTypeError::DeserializationError(
+                "link is missing peerCn",
+            ));
+        }
 
         let mut visas = Vec::new();
         for visa_reader in reader.get_visas()?.iter() {
@@ -129,28 +137,43 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     const TEST_ZPR_ADDR: &str = "fd5a:5052::42";
+    const TEST_PEER_CN: &str = "peer.zpr";
 
+    /// A wire `Link` with both required fields (`zprAddr`, `peerCn`) set.
     fn make_link_msg(
         link_id: &str,
         peer_ip: IpAddr,
         peer_port: u16,
         role: v1::LinkRole,
     ) -> capnp::message::Builder<capnp::message::HeapAllocator> {
-        make_link_msg_with_zpr_addr(link_id, peer_ip, peer_port, role, Some(TEST_ZPR_ADDR))
+        make_link_msg_with(
+            link_id,
+            peer_ip,
+            peer_port,
+            role,
+            Some(TEST_ZPR_ADDR),
+            Some(TEST_PEER_CN),
+        )
     }
 
-    fn make_link_msg_with_zpr_addr(
+    /// A wire `Link`; `zpr_addr` and `peer_cn` are left unset when `None`, to build
+    /// the messages the decoder must reject.
+    fn make_link_msg_with(
         link_id: &str,
         peer_ip: IpAddr,
         peer_port: u16,
         role: v1::LinkRole,
         zpr_addr: Option<&str>,
+        peer_cn: Option<&str>,
     ) -> capnp::message::Builder<capnp::message::HeapAllocator> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut root: v1::link::Builder<'_> = msg.init_root();
             root.set_link_id(link_id);
             root.set_role(role);
+            if let Some(cn) = peer_cn {
+                root.set_peer_cn(cn);
+            }
             if let Some(zpr) = zpr_addr {
                 let ip: IpAddr = zpr.parse().unwrap();
                 let mut zpr_bldr = root.reborrow().init_zpr_addr();
@@ -306,7 +329,7 @@ mod tests {
             role: LinkRole::Active,
             visas: vec![],
             zpr_addr: zpr_ip,
-            peer_cn: String::new(),
+            peer_cn: TEST_PEER_CN.to_string(),
         };
         let result = roundtrip_link(&original);
         assert_eq!(result.zpr_addr, zpr_ip);
@@ -317,8 +340,14 @@ mod tests {
     #[test]
     fn test_link_tryfrom_zpr_addr_absent() {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let msg =
-            make_link_msg_with_zpr_addr("link-no-zpr-addr", ip, 4500, v1::LinkRole::Active, None);
+        let msg = make_link_msg_with(
+            "link-no-zpr-addr",
+            ip,
+            4500,
+            v1::LinkRole::Active,
+            None,
+            Some(TEST_PEER_CN),
+        );
         let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
         assert!(Link::try_from(reader).is_err());
     }
@@ -342,15 +371,37 @@ mod tests {
         assert_eq!(result, original);
     }
 
-    // A sender that predates peerCn leaves it unset. That decodes to an empty CN
-    // (which no peer certificate can match), not to an error.
+    // peerCn is required (ZODE_LINKS.md "Kinds of link"): a link without it must fail
+    // to deserialize.
     #[test]
-    fn test_link_tryfrom_peer_cn_absent_is_empty() {
+    fn test_link_tryfrom_peer_cn_absent_is_rejected() {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let msg = make_link_msg("link-no-cn", ip, 4500, v1::LinkRole::Active);
+        let msg = make_link_msg_with(
+            "link-no-cn",
+            ip,
+            4500,
+            v1::LinkRole::Active,
+            Some(TEST_ZPR_ADDR),
+            None,
+        );
         let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
-        let link = Link::try_from(reader).unwrap();
-        assert_eq!(link.peer_cn, "");
+        assert!(Link::try_from(reader).is_err());
+    }
+
+    // An empty peerCn is the same as a missing one: rejected.
+    #[test]
+    fn test_link_tryfrom_peer_cn_empty_is_rejected() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let msg = make_link_msg_with(
+            "link-empty-cn",
+            ip,
+            4500,
+            v1::LinkRole::Active,
+            Some(TEST_ZPR_ADDR),
+            Some(""),
+        );
+        let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
+        assert!(Link::try_from(reader).is_err());
     }
 
     /// Every pairing between the capnp link state and ours, asserted as explicit
