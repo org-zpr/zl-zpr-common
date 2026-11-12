@@ -24,6 +24,11 @@ pub struct Visa {
     /// Required for type [VisaType::ForwardOnly], optional for type [VisaType::Full]
     pub fwd_pep: Option<FwdPep>,
     pub cons: Option<Constraints>,
+    /// ZPR address of the node this visa's stream arrives from (vs.capnp `Visa.prevHop`).
+    /// Set by the visa service on intermediary and egress visas; `None` on the ingress
+    /// visa. A node accepts a StreamIdRequest for this visa only on the link whose peer's
+    /// topology ZPR address equals this; `None` means it never accepts one (gap 7).
+    pub prev_hop: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +153,7 @@ impl Visa {
             dock_pep: Some(dock_pep),
             fwd_pep: None,
             cons,
+            prev_hop: None,
         }
     }
 
@@ -274,6 +280,12 @@ impl TryFrom<v1::visa::Reader<'_>> for Visa {
         // TODO: constraints not yet implemented.
         let cons = None;
 
+        let prev_hop = if reader.has_prev_hop() {
+            Some(IpAddr::try_from(reader.get_prev_hop()?)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             issuer_id,
             config,
@@ -282,6 +294,7 @@ impl TryFrom<v1::visa::Reader<'_>> for Visa {
             dock_pep,
             fwd_pep,
             cons,
+            prev_hop,
         })
     }
 }
@@ -551,5 +564,90 @@ mod tests {
 
         assert!(decoded.session_key.ingress_key.is_empty());
         assert!(decoded.session_key.egress_key.is_empty());
+    }
+
+    // --- prevHop (gap 7: StreamIdRequest only from the visa's previous hop) ---
+
+    fn full_visa() -> Visa {
+        // config and cons are not carried on the wire; keep them at their defaults.
+        Visa::new(
+            7,
+            0,
+            UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            SRC_V4,
+            DST_V4,
+            DockPepType::TCP(TcpUdpPep::new(4242, 443, EndpointT::Client)),
+            KeySet::new(&[1, 2, 3], &[4, 5, 6]),
+            None,
+        )
+    }
+
+    /// Write a visa with the production writer; return the decoded visa and whether
+    /// `prevHop` was set on the wire.
+    fn round_trip_visa(visa: &Visa) -> (Visa, bool) {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::visa::Builder<'_> = msg.init_root();
+            visa.write_to(&mut root);
+        }
+        let reader: v1::visa::Reader<'_> = msg.get_root_as_reader().unwrap();
+        let on_wire = reader.has_prev_hop();
+        (
+            Visa::try_from(reader).expect("a written visa must decode"),
+            on_wire,
+        )
+    }
+
+    #[test]
+    fn test_visa_new_has_no_prev_hop() {
+        // Visa::new builds an ingress-shaped visa, which never has a previous hop.
+        assert_eq!(full_visa().prev_hop, None);
+    }
+
+    #[test]
+    fn test_prev_hop_round_trips_v4_and_v6() {
+        let v6 = IpAddr::V6(Ipv6Addr::new(0xfd5a, 0x5052, 0, 0, 0, 0, 0, 9));
+        for hop in [IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)), v6] {
+            let mut visa = full_visa();
+            visa.prev_hop = Some(hop);
+
+            let (decoded, on_wire) = round_trip_visa(&visa);
+
+            assert!(on_wire, "prevHop must be written when set");
+            assert_eq!(
+                decoded, visa,
+                "prevHop {hop} did not survive the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unset_prev_hop_stays_unset() {
+        let visa = full_visa();
+
+        let (decoded, on_wire) = round_trip_visa(&visa);
+
+        assert!(!on_wire, "None must leave prevHop unset on the wire");
+        assert_eq!(decoded.prev_hop, None);
+        assert_eq!(decoded, visa);
+    }
+
+    #[test]
+    fn test_forward_only_visa_carries_prev_hop_beside_fwd_pep() {
+        let visa = Visa {
+            visa_type: VisaType::ForwardOnly,
+            dock_pep: None,
+            fwd_pep: Some(FwdPep {
+                next_hop: DST_V4,
+                style: FwdPepStyle::OneWay,
+            }),
+            prev_hop: Some(SRC_V4),
+            ..full_visa()
+        };
+
+        let (decoded, on_wire) = round_trip_visa(&visa);
+
+        assert!(on_wire);
+        assert_eq!(decoded, visa);
     }
 }
