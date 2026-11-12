@@ -87,6 +87,12 @@ impl WriteTo<v1::visa::Builder<'_>> for Visa {
             fpep.write_to(&mut fwd_pep_bldr);
         }
 
+        // Unset on the wire for None (the ingress visa).
+        if let Some(prev_hop) = &self.prev_hop {
+            let mut ip_bldr = bldr.reborrow().init_prev_hop();
+            prev_hop.write_to(&mut ip_bldr);
+        }
+
         if self.cons.is_some() {
             unimplemented!("visa constraints serialization not implemented yet");
         }
