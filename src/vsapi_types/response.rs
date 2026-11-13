@@ -44,6 +44,57 @@ impl TryFrom<v1::login_nonce::Reader<'_>> for LoginNonce {
     }
 }
 
+/// The answer to `VSHandle.requestBootstrapVisas` (vs.capnp `BootstrapVisas`):
+/// both directions of one joining Zode's VS-API flow (joiner -> visa
+/// service:VSAPI and the reverse), in two copies (ZODE_LINKS.md J2-J4).
+///
+/// The decoder guarantees each list holds exactly `BootstrapVisas::VISAS_PER_LIST`
+/// visas; any other count is rejected, so a consumer never sees another shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BootstrapVisas {
+    /// The joiner's copies. The relay forwards them in ZDP message 146 and never
+    /// installs them itself.
+    pub peer: Vec<Visa>,
+    /// The relay's own copies of the same two flows. The relay installs them
+    /// before it hands `peer` off.
+    pub relay: Vec<Visa>,
+}
+
+impl BootstrapVisas {
+    /// Visas in each list: one per direction of the joiner's VS-API flow.
+    pub const VISAS_PER_LIST: usize = 2;
+}
+
+impl TryFrom<v1::bootstrap_visas::Reader<'_>> for BootstrapVisas {
+    type Error = VsapiTypeError;
+
+    /// Decodes both lists. Errs if either list (an unset list reads as empty)
+    /// does not hold exactly `VISAS_PER_LIST` visas, or if any visa is malformed.
+    /// Both counts are checked before any visa is decoded.
+    fn try_from(reader: v1::bootstrap_visas::Reader<'_>) -> Result<Self, Self::Error> {
+        let peer = reader.get_peer()?;
+        let relay = reader.get_relay()?;
+        check_bootstrap_visa_count(peer, "bootstrapVisas.peer must hold exactly 2 visas")?;
+        check_bootstrap_visa_count(relay, "bootstrapVisas.relay must hold exactly 2 visas")?;
+        Ok(BootstrapVisas {
+            peer: peer.iter().map(Visa::try_from).collect::<Result<_, _>>()?,
+            relay: relay.iter().map(Visa::try_from).collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+/// Reject one `BootstrapVisas` list with `count_error` unless it holds exactly
+/// `BootstrapVisas::VISAS_PER_LIST` visas.
+fn check_bootstrap_visa_count(
+    list: capnp::struct_list::Reader<'_, v1::visa::Owned>,
+    count_error: &'static str,
+) -> Result<(), VsapiTypeError> {
+    if list.len() as usize != BootstrapVisas::VISAS_PER_LIST {
+        return Err(VsapiTypeError::DeserializationError(count_error));
+    }
+    Ok(())
+}
+
 /// Info recieved from VS in response to ConnectRequest
 #[derive(Debug)]
 pub struct Connection {
@@ -263,6 +314,7 @@ impl From<v1::ErrorCode> for ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vsapi_types::{DockPepType, EndpointT, KeySet, TcpUdpPep};
     use crate::write_to::WriteTo;
     use std::net::Ipv4Addr;
 
@@ -316,6 +368,119 @@ mod tests {
             nonce.expires_at,
             UNIX_EPOCH + Duration::from_secs(1_800_000_000)
         );
+    }
+
+    // NOTE: config/cons are dropped on read (see Visa::try_from TODO), so keep them at
+    // their defaults or the roundtrip assert compares fields capnp never carried.
+    fn make_visa(issuer_id: u64) -> Visa {
+        Visa::new(
+            issuer_id,
+            0,
+            UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 2, 2, 2)),
+            DockPepType::TCP(TcpUdpPep {
+                source_port: 1111,
+                dest_port: 443,
+                endpoint: EndpointT::Client,
+            }),
+            KeySet::new(&[1, 2, 3], &[4, 5, 6]),
+            None,
+        )
+    }
+
+    /// `n` distinct visas, issuer IDs starting at `first_id`.
+    fn make_visas(first_id: u64, n: u64) -> Vec<Visa> {
+        (first_id..first_id + n).map(make_visa).collect()
+    }
+
+    /// Write `bv` to a wire `BootstrapVisas` and decode it again. The writer does
+    /// not check the counts, so this also builds the malformed messages the
+    /// decoder must reject.
+    fn write_then_read_bootstrap_visas(
+        bv: &BootstrapVisas,
+    ) -> Result<BootstrapVisas, VsapiTypeError> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::bootstrap_visas::Builder<'_> = msg.init_root();
+            bv.write_to(&mut root);
+        }
+        let reader: v1::bootstrap_visas::Reader<'_> = msg.get_root_as_reader().unwrap();
+        BootstrapVisas::try_from(reader)
+    }
+
+    // Both lists, two visas each, survive a write/read roundtrip in order.
+    #[test]
+    fn test_bootstrap_visas_roundtrip() {
+        let original = BootstrapVisas {
+            peer: make_visas(1, 2),
+            relay: make_visas(3, 2),
+        };
+        let result = write_then_read_bootstrap_visas(&original).unwrap();
+        assert_eq!(result, original);
+    }
+
+    // Each list must hold exactly two visas (forward and reverse). Any other count
+    // in either list is rejected, with no fallback.
+    #[test]
+    fn test_bootstrap_visas_wrong_count_is_rejected() {
+        for n in [0, 1, 3] {
+            let bad_peer = BootstrapVisas {
+                peer: make_visas(1, n),
+                relay: make_visas(10, 2),
+            };
+            assert!(
+                write_then_read_bootstrap_visas(&bad_peer).is_err(),
+                "peer list with {n} visas was accepted"
+            );
+
+            let bad_relay = BootstrapVisas {
+                peer: make_visas(1, 2),
+                relay: make_visas(10, n),
+            };
+            assert!(
+                write_then_read_bootstrap_visas(&bad_relay).is_err(),
+                "relay list with {n} visas was accepted"
+            );
+        }
+    }
+
+    // Both counts are checked before any visa is decoded: with two malformed peer
+    // visas and an empty relay list, the error is the relay count error, not the
+    // peer visa's decode error.
+    #[test]
+    fn test_bootstrap_visas_counts_checked_before_decoding() {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::bootstrap_visas::Builder<'_> = msg.init_root();
+            let mut peer = root.reborrow().init_peer(2);
+            for i in 0..2 {
+                // A 3-byte IPv4 prevHop makes the visa fail to decode.
+                peer.reborrow()
+                    .get(i)
+                    .init_prev_hop()
+                    .init_v4(3)
+                    .copy_from_slice(&[10, 0, 0]);
+            }
+        }
+        let reader: v1::bootstrap_visas::Reader<'_> = msg.get_root_as_reader().unwrap();
+        let err = BootstrapVisas::try_from(reader).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VsapiTypeError::DeserializationError(m) if m.contains("relay")
+            ),
+            "expected the relay count error, got {err:?}"
+        );
+    }
+
+    // An empty message (neither list set) is rejected too.
+    #[test]
+    fn test_bootstrap_visas_unset_lists_are_rejected() {
+        let mut msg = capnp::message::Builder::new_default();
+        msg.init_root::<v1::bootstrap_visas::Builder<'_>>();
+        let reader: v1::bootstrap_visas::Reader<'_> = msg.get_root_as_reader().unwrap();
+        assert!(BootstrapVisas::try_from(reader).is_err());
     }
 
     /// Every 1:1 pairing between the capnp deny code and our own.

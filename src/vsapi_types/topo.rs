@@ -1,5 +1,5 @@
 use crate::vsapi::v1;
-use crate::vsapi_types::{SockAddr, Visa, VsapiTypeError};
+use crate::vsapi_types::{SockAddr, VsapiTypeError};
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +13,6 @@ pub struct Link {
     pub link_id: String,
     pub peer: SockAddr,
     pub role: LinkRole,
-    pub visas: Vec<Visa>,
     /// ZPR address of the peer. Required: the node compares it with its own to
     /// decide who dials (ZODE_LINKS.md). The decoder rejects a link without it.
     pub zpr_addr: IpAddr,
@@ -105,16 +104,10 @@ impl TryFrom<v1::link::Reader<'_>> for Link {
             ));
         }
 
-        let mut visas = Vec::new();
-        for visa_reader in reader.get_visas()?.iter() {
-            visas.push(Visa::try_from(visa_reader)?);
-        }
-
         Ok(Link {
             link_id,
             peer,
             role,
-            visas,
             zpr_addr,
             peer_cn,
         })
@@ -131,10 +124,9 @@ impl Link {
 mod tests {
     use super::*;
     use crate::vsapi::v1;
-    use crate::vsapi_types::{DockPepType, EndpointT, KeySet, SockAddr, TcpUdpPep};
+    use crate::vsapi_types::SockAddr;
     use crate::write_to::WriteTo;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    use std::time::{Duration, UNIX_EPOCH};
 
     const TEST_ZPR_ADDR: &str = "fd5a:5052::42";
     const TEST_PEER_CN: &str = "peer.zpr";
@@ -215,25 +207,6 @@ mod tests {
         Link::try_from(reader).unwrap()
     }
 
-    // NOTE: config/cons are dropped on read (see Visa::try_from TODO), so keep them at
-    // their defaults or the roundtrip assert compares fields capnp never carried.
-    fn make_visa(issuer_id: u64) -> Visa {
-        Visa::new(
-            issuer_id,
-            0,
-            UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
-            IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(10, 2, 2, 2)),
-            DockPepType::TCP(TcpUdpPep {
-                source_port: 1111,
-                dest_port: 443,
-                endpoint: EndpointT::Client,
-            }),
-            KeySet::new(&[1, 2, 3], &[4, 5, 6]),
-            None,
-        )
-    }
-
     fn roundtrip_sock_addr(sa: &SockAddr) -> SockAddr {
         let mut msg = capnp::message::Builder::new_default();
         {
@@ -289,7 +262,6 @@ mod tests {
                 port: 8080,
             },
             role: LinkRole::Active,
-            visas: vec![],
             zpr_addr: TEST_ZPR_ADDR.parse().unwrap(),
             peer_cn: "relay.zpr".to_string(),
         };
@@ -308,7 +280,6 @@ mod tests {
                 port: 9000,
             },
             role: LinkRole::Backup,
-            visas: vec![make_visa(7), make_visa(8)],
             zpr_addr: IpAddr::V6("fd5a:5052::7".parse().unwrap()),
             peer_cn: "host-b.zpr".to_string(),
         };
@@ -327,7 +298,6 @@ mod tests {
                 port: 4500,
             },
             role: LinkRole::Active,
-            visas: vec![],
             zpr_addr: zpr_ip,
             peer_cn: TEST_PEER_CN.to_string(),
         };
@@ -362,7 +332,6 @@ mod tests {
                 port: 5000,
             },
             role: LinkRole::Active,
-            visas: vec![],
             zpr_addr: TEST_ZPR_ADDR.parse().unwrap(),
             peer_cn: "endpoint-a.zpr".to_string(),
         };
