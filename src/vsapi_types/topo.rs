@@ -11,7 +11,13 @@ pub enum LinkRole {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
     pub link_id: String,
-    pub peer: SockAddr,
+    /// Substrate address of the peer, for the end that dials this link
+    /// (vs.capnp `Link.peer`). `None` when the receiving Zode never dials it: the
+    /// relay, or a peer reached through the receiving Zode's initial link. A Zode
+    /// rejects and logs a link it owns without one. When set, it is a concrete IP
+    /// and a nonzero port: the decoder rejects a link whose peer is not
+    /// (ZODE_LINKS.md rule 13b).
+    pub peer: Option<SockAddr>,
     pub role: LinkRole,
     /// ZPR address of the peer. Required: the node compares it with its own to
     /// decide who dials (ZODE_LINKS.md). The decoder rejects a link without it.
@@ -88,7 +94,19 @@ impl TryFrom<v1::link::Reader<'_>> for Link {
 
     fn try_from(reader: v1::link::Reader<'_>) -> Result<Self, Self::Error> {
         let link_id = reader.get_link_id()?.to_string()?;
-        let peer = SockAddr::try_from(reader.get_peer()?)?;
+        // Unset means the receiving Zode never dials this link. Set, it must be an
+        // address a Zode can dial: no unspecified IP or port 0 as a sentinel.
+        let peer = if reader.has_peer() {
+            let peer = SockAddr::try_from(reader.get_peer()?)?;
+            if peer.addr.is_unspecified() || peer.port == 0 {
+                return Err(VsapiTypeError::DeserializationError(
+                    "link peer must be a concrete IP and a nonzero port",
+                ));
+            }
+            Some(peer)
+        } else {
+            None
+        };
         let role = LinkRole::from(reader.get_role()?);
         if !reader.has_zpr_addr() {
             return Err(VsapiTypeError::DeserializationError(
@@ -140,20 +158,18 @@ mod tests {
     ) -> capnp::message::Builder<capnp::message::HeapAllocator> {
         make_link_msg_with(
             link_id,
-            peer_ip,
-            peer_port,
+            Some((peer_ip, peer_port)),
             role,
             Some(TEST_ZPR_ADDR),
             Some(TEST_PEER_CN),
         )
     }
 
-    /// A wire `Link`; `zpr_addr` and `peer_cn` are left unset when `None`, to build
-    /// the messages the decoder must reject.
+    /// A wire `Link`; `peer`, `zpr_addr` and `peer_cn` are left unset when `None`,
+    /// to build the messages the decoder must accept as optional or reject.
     fn make_link_msg_with(
         link_id: &str,
-        peer_ip: IpAddr,
-        peer_port: u16,
+        peer: Option<(IpAddr, u16)>,
         role: v1::LinkRole,
         zpr_addr: Option<&str>,
         peer_cn: Option<&str>,
@@ -180,17 +196,19 @@ mod tests {
                     }
                 }
             }
-            let mut peer = root.reborrow().init_peer();
-            peer.set_port(peer_port);
-            let mut addr_bldr = peer.reborrow().init_addr();
-            match peer_ip {
-                IpAddr::V4(ipv4) => {
-                    let buf = addr_bldr.reborrow().init_v4(4);
-                    buf.copy_from_slice(&ipv4.octets());
-                }
-                IpAddr::V6(ipv6) => {
-                    let buf = addr_bldr.reborrow().init_v6(16);
-                    buf.copy_from_slice(&ipv6.octets());
+            if let Some((peer_ip, peer_port)) = peer {
+                let mut peer = root.reborrow().init_peer();
+                peer.set_port(peer_port);
+                let mut addr_bldr = peer.reborrow().init_addr();
+                match peer_ip {
+                    IpAddr::V4(ipv4) => {
+                        let buf = addr_bldr.reborrow().init_v4(4);
+                        buf.copy_from_slice(&ipv4.octets());
+                    }
+                    IpAddr::V6(ipv6) => {
+                        let buf = addr_bldr.reborrow().init_v6(16);
+                        buf.copy_from_slice(&ipv6.octets());
+                    }
                 }
             }
         }
@@ -236,8 +254,13 @@ mod tests {
         let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
         let link = Link::try_from(reader).unwrap();
         assert_eq!(link.link_id, "link-v4-active");
-        assert_eq!(link.peer.addr, ip);
-        assert_eq!(link.peer.port, 4500);
+        assert_eq!(
+            link.peer,
+            Some(SockAddr {
+                addr: ip,
+                port: 4500
+            })
+        );
         assert_eq!(link.role, LinkRole::Active);
     }
 
@@ -248,8 +271,13 @@ mod tests {
         let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
         let link = Link::try_from(reader).unwrap();
         assert_eq!(link.link_id, "link-v6-backup");
-        assert_eq!(link.peer.addr, ip);
-        assert_eq!(link.peer.port, 6000);
+        assert_eq!(
+            link.peer,
+            Some(SockAddr {
+                addr: ip,
+                port: 6000
+            })
+        );
         assert_eq!(link.role, LinkRole::Backup);
     }
 
@@ -257,10 +285,10 @@ mod tests {
     fn test_link_roundtrip_active_ipv4() {
         let original = Link {
             link_id: "rt-v4-active".to_string(),
-            peer: SockAddr {
+            peer: Some(SockAddr {
                 addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
                 port: 8080,
-            },
+            }),
             role: LinkRole::Active,
             zpr_addr: TEST_ZPR_ADDR.parse().unwrap(),
             peer_cn: "relay.zpr".to_string(),
@@ -273,12 +301,12 @@ mod tests {
     fn test_link_roundtrip_backup_ipv6() {
         let original = Link {
             link_id: "rt-v6-backup".to_string(),
-            peer: SockAddr {
+            peer: Some(SockAddr {
                 addr: IpAddr::V6(Ipv6Addr::from([
                     0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
                 ])),
                 port: 9000,
-            },
+            }),
             role: LinkRole::Backup,
             zpr_addr: IpAddr::V6("fd5a:5052::7".parse().unwrap()),
             peer_cn: "host-b.zpr".to_string(),
@@ -293,10 +321,10 @@ mod tests {
         let zpr_ip: IpAddr = "fd5a:5052::42".parse().unwrap();
         let original = Link {
             link_id: "rt-zpr-addr".to_string(),
-            peer: SockAddr {
+            peer: Some(SockAddr {
                 addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
                 port: 4500,
-            },
+            }),
             role: LinkRole::Active,
             zpr_addr: zpr_ip,
             peer_cn: TEST_PEER_CN.to_string(),
@@ -312,8 +340,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let msg = make_link_msg_with(
             "link-no-zpr-addr",
-            ip,
-            4500,
+            Some((ip, 4500)),
             v1::LinkRole::Active,
             None,
             Some(TEST_PEER_CN),
@@ -327,10 +354,10 @@ mod tests {
     fn test_link_roundtrip_peer_cn() {
         let original = Link {
             link_id: "rt-peer-cn".to_string(),
-            peer: SockAddr {
+            peer: Some(SockAddr {
                 addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
                 port: 5000,
-            },
+            }),
             role: LinkRole::Active,
             zpr_addr: TEST_ZPR_ADDR.parse().unwrap(),
             peer_cn: "endpoint-a.zpr".to_string(),
@@ -347,8 +374,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let msg = make_link_msg_with(
             "link-no-cn",
-            ip,
-            4500,
+            Some((ip, 4500)),
             v1::LinkRole::Active,
             Some(TEST_ZPR_ADDR),
             None,
@@ -363,14 +389,89 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let msg = make_link_msg_with(
             "link-empty-cn",
-            ip,
-            4500,
+            Some((ip, 4500)),
             v1::LinkRole::Active,
             Some(TEST_ZPR_ADDR),
             Some(""),
         );
         let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
         assert!(Link::try_from(reader).is_err());
+    }
+
+    /// Decode a wire `Link` whose `peer` is `peer` and whose other fields are valid.
+    fn decode_link_with_peer(peer: Option<(IpAddr, u16)>) -> Result<Link, VsapiTypeError> {
+        let msg = make_link_msg_with(
+            "link-peer",
+            peer,
+            v1::LinkRole::Active,
+            Some(TEST_ZPR_ADDR),
+            Some(TEST_PEER_CN),
+        );
+        let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
+        Link::try_from(reader)
+    }
+
+    // An unset peer decodes to `None`: the receiving Zode never dials this link
+    // (the relay; a peer reached through the receiving Zode's initial link).
+    #[test]
+    fn test_link_tryfrom_peer_unset_is_none() {
+        let link = decode_link_with_peer(None).unwrap();
+        assert_eq!(link.peer, None);
+    }
+
+    // A set, concrete peer decodes to `Some` with that address.
+    #[test]
+    fn test_link_tryfrom_peer_set_is_some() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let link = decode_link_with_peer(Some((ip, 5000))).unwrap();
+        assert_eq!(
+            link.peer,
+            Some(SockAddr {
+                addr: ip,
+                port: 5000
+            })
+        );
+    }
+
+    // A link with no peer round-trips as `None`: the writer leaves `peer` unset.
+    #[test]
+    fn test_link_roundtrip_peer_none() {
+        let original = Link {
+            link_id: "rt-no-peer".to_string(),
+            peer: None,
+            role: LinkRole::Active,
+            zpr_addr: TEST_ZPR_ADDR.parse().unwrap(),
+            peer_cn: TEST_PEER_CN.to_string(),
+        };
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::link::Builder<'_> = msg.init_root();
+            original.write_to(&mut root);
+        }
+        let reader: v1::link::Reader<'_> = msg.get_root_as_reader().unwrap();
+        assert!(!reader.has_peer());
+        assert_eq!(Link::try_from(reader).unwrap(), original);
+    }
+
+    // A set peer of `[::]:0` is no address at all: rejected, never a sentinel.
+    #[test]
+    fn test_link_tryfrom_peer_unspecified_v6_port_0_is_rejected() {
+        let peer = (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        assert!(decode_link_with_peer(Some(peer)).is_err());
+    }
+
+    // A set peer with an unspecified IP is rejected even with a real port.
+    #[test]
+    fn test_link_tryfrom_peer_unspecified_v4_is_rejected() {
+        let peer = (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5000);
+        assert!(decode_link_with_peer(Some(peer)).is_err());
+    }
+
+    // A set peer with port 0 is rejected even with a concrete IP.
+    #[test]
+    fn test_link_tryfrom_peer_port_0_is_rejected() {
+        let peer = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 0);
+        assert!(decode_link_with_peer(Some(peer)).is_err());
     }
 
     /// Every pairing between the capnp link state and ours, asserted as explicit
