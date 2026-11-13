@@ -70,30 +70,29 @@ impl TryFrom<v1::bootstrap_visas::Reader<'_>> for BootstrapVisas {
 
     /// Decodes both lists. Errs if either list (an unset list reads as empty)
     /// does not hold exactly `VISAS_PER_LIST` visas, or if any visa is malformed.
+    /// Both counts are checked before any visa is decoded.
     fn try_from(reader: v1::bootstrap_visas::Reader<'_>) -> Result<Self, Self::Error> {
-        let peer = read_bootstrap_visa_list(
-            reader.get_peer()?,
-            "bootstrapVisas.peer must hold exactly 2 visas",
-        )?;
-        let relay = read_bootstrap_visa_list(
-            reader.get_relay()?,
-            "bootstrapVisas.relay must hold exactly 2 visas",
-        )?;
-        Ok(BootstrapVisas { peer, relay })
+        let peer = reader.get_peer()?;
+        let relay = reader.get_relay()?;
+        check_bootstrap_visa_count(peer, "bootstrapVisas.peer must hold exactly 2 visas")?;
+        check_bootstrap_visa_count(relay, "bootstrapVisas.relay must hold exactly 2 visas")?;
+        Ok(BootstrapVisas {
+            peer: peer.iter().map(Visa::try_from).collect::<Result<_, _>>()?,
+            relay: relay.iter().map(Visa::try_from).collect::<Result<_, _>>()?,
+        })
     }
 }
 
-/// Decode one `BootstrapVisas` list, rejecting it with `count_error` unless it
-/// holds exactly `BootstrapVisas::VISAS_PER_LIST` visas. The count is checked
-/// before any visa is decoded.
-fn read_bootstrap_visa_list(
+/// Reject one `BootstrapVisas` list with `count_error` unless it holds exactly
+/// `BootstrapVisas::VISAS_PER_LIST` visas.
+fn check_bootstrap_visa_count(
     list: capnp::struct_list::Reader<'_, v1::visa::Owned>,
     count_error: &'static str,
-) -> Result<Vec<Visa>, VsapiTypeError> {
+) -> Result<(), VsapiTypeError> {
     if list.len() as usize != BootstrapVisas::VISAS_PER_LIST {
         return Err(VsapiTypeError::DeserializationError(count_error));
     }
-    list.iter().map(Visa::try_from).collect()
+    Ok(())
 }
 
 /// Info recieved from VS in response to ConnectRequest
@@ -444,6 +443,35 @@ mod tests {
                 "relay list with {n} visas was accepted"
             );
         }
+    }
+
+    // Both counts are checked before any visa is decoded: with two malformed peer
+    // visas and an empty relay list, the error is the relay count error, not the
+    // peer visa's decode error.
+    #[test]
+    fn test_bootstrap_visas_counts_checked_before_decoding() {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut root: v1::bootstrap_visas::Builder<'_> = msg.init_root();
+            let mut peer = root.reborrow().init_peer(2);
+            for i in 0..2 {
+                // A 3-byte IPv4 prevHop makes the visa fail to decode.
+                peer.reborrow()
+                    .get(i)
+                    .init_prev_hop()
+                    .init_v4(3)
+                    .copy_from_slice(&[10, 0, 0]);
+            }
+        }
+        let reader: v1::bootstrap_visas::Reader<'_> = msg.get_root_as_reader().unwrap();
+        let err = BootstrapVisas::try_from(reader).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VsapiTypeError::DeserializationError(m) if m.contains("relay")
+            ),
+            "expected the relay count error, got {err:?}"
+        );
     }
 
     // An empty message (neither list set) is rejected too.
