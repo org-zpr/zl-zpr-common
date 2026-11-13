@@ -20,8 +20,11 @@ impl WriteTo<v1::sock_addr::Builder<'_>> for SockAddr {
 impl WriteTo<v1::link::Builder<'_>> for Link {
     fn write_to(&self, bldr: &mut v1::link::Builder<'_>) {
         bldr.set_link_id(&self.link_id);
-        let mut peer_bldr = bldr.reborrow().init_peer();
-        self.peer.write_to(&mut peer_bldr);
+        // `None` leaves `peer` unset: the receiving Zode never dials this link.
+        if let Some(peer) = &self.peer {
+            let mut peer_bldr = bldr.reborrow().init_peer();
+            peer.write_to(&mut peer_bldr);
+        }
         bldr.set_role(match self.role {
             LinkRole::Active => v1::LinkRole::Active,
             LinkRole::Backup => v1::LinkRole::Backup,
