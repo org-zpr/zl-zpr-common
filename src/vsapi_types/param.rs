@@ -17,9 +17,6 @@ pub mod pname {
 
     /// Used for A2A Diffie-Hellman public key exchange.
     pub const A2A_DH_PUBKEY: &str = "a2a_dh_pubkey";
-
-    /// Node's advertised substrate address, sent as a string param "ip:port".
-    pub const SUBSTRATE_ADDR: &str = "substrate_addr";
 }
 
 #[derive(Debug)]
