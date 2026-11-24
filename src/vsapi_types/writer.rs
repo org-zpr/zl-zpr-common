@@ -2,10 +2,10 @@ use std::net::IpAddr;
 
 use crate::vsapi::v1;
 use crate::vsapi_types::{
-    ApiResponseError, AuthBlob, ChallengeAlg, Claim, CommFlag, ConnectRequest, Connection, DockPep,
-    DockPepType, EndpointT, FwdPep, FwdPepStyle, IcmpPep, KeySet, Link, LinkRole, PacketDesc,
-    Param, ParamValue, PublicKey, ReauthRequest, ServiceDescriptor, ServiceT, SockAddr, TcpUdpPep,
-    VSConnectRequest, Visa, VisaOp, VisaType,
+    ApiResponseError, AuthBlob, BootstrapVisas, ChallengeAlg, Claim, CommFlag, ConnectRequest,
+    Connection, DockPep, DockPepType, EndpointT, FwdPep, FwdPepStyle, IcmpPep, KeySet, Link,
+    LinkRole, LinkStateReport, LoginNonce, PacketDesc, Param, ParamValue, PublicKey, ReauthRequest,
+    ServiceDescriptor, ServiceT, SockAddr, TcpUdpPep, VSConnectRequest, Visa, VisaOp, VisaType,
 };
 use crate::write_to::WriteTo;
 
@@ -20,19 +20,54 @@ impl WriteTo<v1::sock_addr::Builder<'_>> for SockAddr {
 impl WriteTo<v1::link::Builder<'_>> for Link {
     fn write_to(&self, bldr: &mut v1::link::Builder<'_>) {
         bldr.set_link_id(&self.link_id);
-        let mut peer_bldr = bldr.reborrow().init_peer();
-        self.peer.write_to(&mut peer_bldr);
+        // `None` leaves `peer` unset: the receiving Zode never dials this link.
+        if let Some(peer) = &self.peer {
+            let mut peer_bldr = bldr.reborrow().init_peer();
+            peer.write_to(&mut peer_bldr);
+        }
         bldr.set_role(match self.role {
             LinkRole::Active => v1::LinkRole::Active,
             LinkRole::Backup => v1::LinkRole::Backup,
         });
         let mut zpr_addr_bldr = bldr.reborrow().init_zpr_addr();
         self.zpr_addr.write_to(&mut zpr_addr_bldr);
-        let mut visas_bldr = bldr.reborrow().init_visas(self.visas.len() as u32);
-        for (i, visa) in self.visas.iter().enumerate() {
-            let mut visa_bldr = visas_bldr.reborrow().get(i as u32);
-            visa.write_to(&mut visa_bldr);
-        }
+        bldr.set_peer_cn(&self.peer_cn);
+    }
+}
+
+impl WriteTo<v1::bootstrap_visas::Builder<'_>> for BootstrapVisas {
+    /// Writes both lists as given. The count rule (exactly two visas each) is
+    /// enforced by the reader, so a malformed answer never reaches a consumer.
+    fn write_to(&self, bldr: &mut v1::bootstrap_visas::Builder<'_>) {
+        write_visa_list(
+            &self.peer,
+            bldr.reborrow().init_peer(self.peer.len() as u32),
+        );
+        write_visa_list(
+            &self.relay,
+            bldr.reborrow().init_relay(self.relay.len() as u32),
+        );
+    }
+}
+
+/// Write `visas` into a capnp visa list already sized to `visas.len()`.
+fn write_visa_list(visas: &[Visa], mut list: capnp::struct_list::Builder<'_, v1::visa::Owned>) {
+    for (i, visa) in visas.iter().enumerate() {
+        visa.write_to(&mut list.reborrow().get(i as u32));
+    }
+}
+
+impl WriteTo<v1::link_state_report::Builder<'_>> for LinkStateReport {
+    fn write_to(&self, bldr: &mut v1::link_state_report::Builder<'_>) {
+        bldr.set_peer_cn(&self.peer_cn);
+        bldr.set_state(self.state.into());
+    }
+}
+
+impl WriteTo<v1::login_nonce::Builder<'_>> for LoginNonce {
+    fn write_to(&self, bldr: &mut v1::login_nonce::Builder<'_>) {
+        bldr.set_nonce(&self.nonce);
+        bldr.set_expires_at(self.expires_at_secs());
     }
 }
 
@@ -70,6 +105,12 @@ impl WriteTo<v1::visa::Builder<'_>> for Visa {
         if let Some(fpep) = &self.fwd_pep {
             let mut fwd_pep_bldr = bldr.reborrow().init_fwd_pep();
             fpep.write_to(&mut fwd_pep_bldr);
+        }
+
+        // Unset on the wire for None (the ingress visa).
+        if let Some(prev_hop) = &self.prev_hop {
+            let mut ip_bldr = bldr.reborrow().init_prev_hop();
+            prev_hop.write_to(&mut ip_bldr);
         }
 
         if self.cons.is_some() {
